@@ -23,7 +23,7 @@ public static class BotOffsets
 public class BotAI : BasePlugin
 {
     public override string ModuleName        => "Patches - Bot AI";
-    public override string ModuleVersion     => "1.6.7";
+    public override string ModuleVersion     => "1.7.0";
     public override string ModuleAuthor      => "K4ryuu & Austin (updated by ed0ard)";
     public override string ModuleDescription =>
         "Improve and fix bots' behavior comprehensively";
@@ -277,6 +277,116 @@ public class BotAI : BasePlugin
             patch:            "EB 0D",
             expectedOriginal: "75 0D",
             patchOffset:      2    //RVA 0x31931c: jne → jmp
+        ),
+
+
+        // Source: IdleState::OnUpdate, T-side "bomb planted but site unknown" path
+        //   bombSite = GetGameState()->GetNextBombsiteToSearch();
+        //   → replaced with:
+        //   bombSite = GetGameState()->GetPlantedBombsite();
+        // With the patch active: [gameState+0x68] is set at plant time for all bots.
+        //  directly to the planted site instead of random searching.
+        ["TBot_BombsiteSearch_UseKnownPlantedSite"] = (
+            signature:        "48 8B 8E 18 5E 00 00 E8 ? ? ? ? 49 8B CC E8 ? ? ? ? 4C 8B 05 ? ? ? ? 85 C0",
+            patch:            "E8 35 49 F9 FF",
+            expectedOriginal: "E8 B5 42 F9 FF",
+            patchOffset:      15
+        ),
+
+        // Source: cs_bot_event_bomb / OnBombBeep handler
+        //   const float bombBeepHearRangeSq = 1500.0f * 1500.0f;
+        //   if (rangeSq > bombBeepHearRangeSq) return;
+        // NOP the jbe → CT bots always enter the bombsite-update path,
+        // regardless of distance to the bomb.
+        ["BombBeep_CT_GlobalHearRange"] = (
+            signature:        "F3 0F 59 F6 F3 0F 59 DB F3 0F 59 D2 F3 0F 58 DA F3 0F 58 DE 0F 2F C3 76 67",
+            patch:            "90 90",
+            expectedOriginal: "76 67",
+            patchOffset:      23
+        ),
+
+        // Source: cs_bot_event_bomb.cpp — OnBombPickedUp
+        //   const float bombPickupHearRangeSq = 1000.0f * 1000.0f;
+        //   if (LengthSqr() < bombPickupHearRangeSq) → CT tracks bomber
+        // NOP jbe → all CT bots always track who picks up the bomb.
+        ["BombPickup_CT_GlobalHearRange"] = (
+            signature:        "F3 0F 5C 78 08 F3 0F 59 D2 F3 0F 59 FF F3 0F 58 CA F3 0F 58 CF 0F 28 BC 24 E0 00 00 00 0F 2F C1 76 23",
+            patch:            "90 90",
+            expectedOriginal: "76 23",
+            patchOffset:      32
+        ),
+
+        // Source: CCSBot::OnAudibleEvent — universal sound event gate
+        //   if (newNoiseDist < range) → heard
+        // All sound events (weapon_fire, footsteps, reload, grenade bounce,
+        //   door, flashbang, etc.) funnel through OnAudibleEvent.
+        // NOP the jbe (6 bytes: 0F 86 → 90 90 90 90 90 90) → every bot
+        // hears every sound event regardless of distance. This replaces the
+        // need for individual per-event patches
+        ["OnAudibleEvent_GlobalHearRange"] = (
+            signature:        "F3 44 0F 51 CA EB 0C 0F 28 C2 E8 ? ? ? ? 44 0F 28 C8 45 0F 2F D1 0F 86 ? ? ? ?",
+            patch:            "90 90 90 90 90 90",
+            expectedOriginal: "0F 86 F4 03 00 00",
+            patchOffset:      23
+        ),
+   
+        // Source: CSGameState::OnBombPlanted (cs_gamestate)
+        //   // Terrorists always know where the bomb is
+        //   if (m_owner->GetTeamNumber() == TEAM_TERRORIST && plantingPlayer)
+        //       UpdatePlantedBomb(plantingPlayer->GetAbsOrigin());
+        // NOP the jne (75 6D → 90 90) → ALL bots get
+        ["OnBombPlanted_AllBotsLearnSite"] = (
+            signature:        "80 BA 44 03 00 00 02 75 6D 48 85 DB 74 68",
+            patch:            "90 90",
+            expectedOriginal: "75 6D",
+            patchOffset:      7
+        ), 
+
+        // Source: cs_bot_defuse_bomb.cpp — DefuseBombState enter
+        //   me->SetDisposition(SELF_DEFENSE);  ← suppresses investigate-noise,
+        //   prevents the bot from reacting to anything except direct threats.
+        //   SELF_DEFENSE=2, ENGAGE_AND_INVESTIGATE=0, OPPORTUNITY_FIRE=1
+        // Patch edx=2 → edx=0 (ENGAGE_AND_INVESTIGATE) so the defusing CT
+        // will chase noises and actively hunt while moving to defuse.
+        ["CT_Defuse_EngageAndInvestigate"] = (
+            signature:        "C7 86 B0 05 00 00 03 00 00 00 BA 02 00 00 00 48 8B CE",
+            patch:            "BA 00 00 00 00",
+            expectedOriginal: "BA 02 00 00 00",
+            patchOffset:      10
+        ),
+
+        // Source: cs_bot_defuse_bomb.cpp — DefuseBombState::OnUpdate
+        //   me->SetDisposition(CCSBot::SELF_DEFENSE); 
+        // mov edx, 2 (SELF_DEFENSE)-> 0 (ENGAGE_AND_INVESTIGATE)
+        ["DefuseBombState_OnUpdate_OpportunityFire"] = (
+            signature:        "48 8D 8A 10 51 00 00 48 8B DA E8 ? ? ? ? BA 02 00 00 00 48 8B CB",
+            patch:            "BA 00 00 00 00",
+            expectedOriginal: "BA 02 00 00 00",
+            patchOffset:      15
+        ),
+
+        // Source: cs_bot_defuse_bomb.cpp — DefuseBombState::OnEnter
+        //   me->SetDisposition(CCSBot::SELF_DEFENSE);
+        // SetDisposition call at RVA 0x334CC5: edx=2 (SELF_DEFENSE)
+        // patch edx=2 → edx=0 (ENGAGE_AND_INVESTIGATE)
+        ["DefuseBombState_OnEnter_EngageAndInvestigate"] = (
+            signature:        "48 89 5C 24 08 57 48 83 EC 20 48 8B DA BA 02 00 00 00 48 8B CB",
+            patch:            "BA 00 00 00 00",
+            expectedOriginal: "BA 02 00 00 00",
+            patchOffset:      13
+        ),
+
+
+        // Source: cs_bot_weapon.cpp — CheckGrenadeDanger(), flash avoidance block
+        //   m_me->ClearLookAt();     ← KEPT (writes to bot state fields, harmless)
+        //   m_me->SetLookAt("Avoid Flashbang", away, PRIORITY_UNINTERRUPTABLE, duration);  ← PATCHED OUT
+        //   m_me->StopAiming();      ← PATCHED OUT
+        //   return false;            ← KEPT (return value unchanged, avoid crash)
+        ["FlashbangAvoidance_Disable"] = (
+            signature:        "49 8B 0E 0F 14 E3 F2 0F 11 65 17 F3 0F 11 55 1F F3 0F 11 4C 24 20 E8 ? ? ? ? 49 8B 06 C6 80 64 5C 00 00 00",
+            patch:            "90 90 90 90 90 90 90 90 90 90 90 90 90 90 90",
+            expectedOriginal: "E8 8E BA 02 00 49 8B 06 C6 80 64 5C 00 00 00",
+            patchOffset:      22
         ),
     };
 
