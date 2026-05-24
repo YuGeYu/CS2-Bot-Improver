@@ -94,6 +94,14 @@ public class RoundCounter
     public int Molotov { get; set; }
 }
 
+public class UtilityLimit
+{
+    public int Flash { get; init; }
+    public int Smoke { get; init; }
+    public int HE { get; init; }
+    public int Molotov { get; init; }
+}
+
 // ═══════════════════════════════════════════════════════════════
 //  Plugin
 // ═══════════════════════════════════════════════════════════════
@@ -118,6 +126,7 @@ public class NadeSystemPlugin : BasePlugin
     private bool                  _roundOver         = false;
     private float                 _freezeEndTime     = 0f;
     private Dictionary<uint, int> _roundSpendPerBot  = new();
+    private Dictionary<uint, int> _roundUtilityBudgetByBot = new();
     private HashSet<uint>         _poorBots          = new();
     // flash immunity
     private Dictionary<uint, float> _botFlashImmunityUntil = new();
@@ -130,6 +139,7 @@ public class NadeSystemPlugin : BasePlugin
     private bool _plantSmokeUsed     = false;
     // key = TeamNum (2=T, 3=CT)
     private Dictionary<int, RoundCounter> _roundCountByTeam = new();
+    private Dictionary<uint, RoundCounter> _roundCountByBot = new();
     // key = bot Id, value = first continuous damage time
     private Dictionary<uint, float> _botMolotovDmgStart = new();
     // team-side cooldown: key = teamNum (2=T,3=CT), value = expiry time
@@ -142,6 +152,21 @@ public class NadeSystemPlugin : BasePlugin
     // Normal Mode: post-throw probability window for flash
     // key = botIndex, value = (windowExpiresAt, blindRatio)
     private Dictionary<uint, (float ExpiresAt, float Ratio)> _botFlashRatioWindow = new();
+    private static readonly UtilityLimit TeamRoundLimit = new()
+    {
+        Flash = 10,
+        Smoke = 5,
+        HE = 5,
+        Molotov = 5,
+    };
+
+    private static readonly UtilityLimit BotRoundLimit = new()
+    {
+        Flash = 2,
+        Smoke = 1,
+        HE = 1,
+        Molotov = 1,
+    };
     // ── Static lookup tables ───────────────────────────────────
     // (mapName_teamTag) → seconds after freezeend within which smoke/flash may trigger
     // e.g. "de_dust2_T" → 10f  means T-side nades tagged "T" must trigger within 10s of freezeend
@@ -199,6 +224,7 @@ public class NadeSystemPlugin : BasePlugin
         ["smoke"]   = 300,
         ["he"]      = 300,
         ["molotov"] = 400,
+        ["incgrenade"] = 400,
         ["decoy"]   = 0,
     };
 
@@ -210,6 +236,7 @@ public class NadeSystemPlugin : BasePlugin
         ["smoke"]   = 300,
         ["he"]      = 300,
         ["molotov"] = 500,
+        ["incgrenade"] = 500,
         ["decoy"]   = 0,
     };
 
@@ -376,9 +403,10 @@ public class NadeSystemPlugin : BasePlugin
                     if (IsOnCooldown(g.Id)) continue;
                     if (dx * dx + dy * dy > 200f * 200f) continue;
                     if (MathF.Abs(dz) > 85f) continue;
+                    if (!TryCommitUtilityUse(bot, gtype, deductMoney: false)) continue;
                     RegisterCooldown(g.Id, "decoy");
                     SpawnProjectile(bot, g);
-                    // No _replayBots, no IncrementCount, no money deduction
+                    // No _replayBots and no money deduction for decoy.
                     break;
                 }
                 // Not DECOY
@@ -523,71 +551,10 @@ public class NadeSystemPlugin : BasePlugin
 
         var gtype = g.GrenadeType.ToLower();
 
-        // ── Round limit checks ─────────────────────────────────
-        if (_botNadesMode == "normal")
-        {
-            int teamNum = bot.TeamNum;
-            int teamSize = Utilities
-                .FindAllEntitiesByDesignerName<CCSPlayerController>("cs_player_controller")
-                .Count(p => p.IsValid && p.IsBot && (int)p.TeamNum == teamNum);
-            if (teamSize < 1) teamSize = 1;
-
-            if (!_roundCountByTeam.TryGetValue(teamNum, out var teamCount))
-                teamCount = new RoundCounter();
-
-            if (gtype == "flash")
-            {
-                var cv  = ConVar.Find("ammo_grenade_limit_flashbang");
-                int max = (cv?.GetPrimitiveValue<int>() ?? 2) * teamSize;
-                if (teamCount.Flash >= max) return;
-            }
-            else
-            {
-                int used = gtype switch
-                {
-                    "smoke"   => teamCount.Smoke,
-                    "he"      => teamCount.HE,
-                    "molotov" => teamCount.Molotov,
-                    _         => 99,
-                };
-                if (used >= teamSize) return;
-            }
-        }
-        // The only two differences between more and normal modes are the round limit and the early smoke limit
-        else if (_botNadesMode == "max" || _botNadesMode == "more")
-        {
-            // no limits
-        }
-
-        // ── Account check ──────────────────────────────────────────────
-        var money = bot.InGameMoneyServices;
-        if (money == null) return;
-
-        bool isCT     = bot.TeamNum == (int)CsTeam.CounterTerrorist;
-        var costTable = isCT ? CostCT : CostT;
-        if (!costTable.TryGetValue(gtype, out int cost)) return;
-        if (money.Account < cost) return;
-
-        // ── Round spend cap check ──────────────────────────────────────
-        uint botIdx   = (uint)bot.Index;
-        bool isPoor   = _poorBots.Contains((uint)bot.Index);
-        int  spendCap = GetRoundSpendCap(isCT, isPoor);
-        if (!_roundSpendPerBot.TryGetValue(botIdx, out int alreadySpent))
-            alreadySpent = 0;
-        // Expensure Limit
-        bool deductMoney = alreadySpent < spendCap;
-
-        // ── All checks passed — commit ─────────────────────────────────
-        if (deductMoney)
-        {
-            money.Account -= cost;
-            Utilities.SetStateChanged(bot, "CCSPlayerController", "m_pInGameMoneyServices");
-            _roundSpendPerBot[botIdx] = alreadySpent + cost;
-        }
+        if (!TryCommitUtilityUse(bot, gtype, deductMoney: true)) return;
 
         _replayBots.Add((uint)bot.Index);
         RegisterCooldown(g.Id, gtype);
-        IncrementCount(gtype, bot.TeamNum);
         // Normal Mode early smoke limit
         if (_botNadesMode == "normal" && gtype == "smoke"
             && _freezeEndTime > 0f && Server.CurrentTime - _freezeEndTime < 10f)
@@ -735,6 +702,13 @@ public class NadeSystemPlugin : BasePlugin
                     smoke.Thrower.Raw         = botPawn.EntityHandle.Raw;
                     smoke.OriginalThrower.Raw = botPawn.EntityHandle.Raw;
                     smoke.OwnerEntity.Raw     = botPawn.EntityHandle.Raw;
+                    smoke.InitialPosition.X   = origin.X;
+                    smoke.InitialPosition.Y   = origin.Y;
+                    smoke.InitialPosition.Z   = origin.Z;
+                    smoke.InitialVelocity.X   = velocity.X;
+                    smoke.InitialVelocity.Y   = velocity.Y;
+                    smoke.InitialVelocity.Z   = velocity.Z;
+                    smoke.Elasticity          = 0.33f;
                     Server.PrintToConsole(
                         $"[NadeSystem] Replayed [smoke] id={g.Id[..8]}... " +
                         $"bot=[{bot.PlayerName}] " +
@@ -762,6 +736,13 @@ public class NadeSystemPlugin : BasePlugin
                     he.Thrower.Raw         = botPawn.EntityHandle.Raw;
                     he.OriginalThrower.Raw = botPawn.EntityHandle.Raw;
                     he.OwnerEntity.Raw     = botPawn.EntityHandle.Raw;
+                    he.InitialPosition.X   = origin.X;
+                    he.InitialPosition.Y   = origin.Y;
+                    he.InitialPosition.Z   = origin.Z;
+                    he.InitialVelocity.X   = velocity.X;
+                    he.InitialVelocity.Y   = velocity.Y;
+                    he.InitialVelocity.Z   = velocity.Z;
+                    he.Elasticity          = 0.33f;
                     Server.PrintToConsole(
                         $"[NadeSystem] Replayed [he] id={g.Id[..8]}... " +
                         $"bot=[{bot.PlayerName}] " +
@@ -791,6 +772,13 @@ public class NadeSystemPlugin : BasePlugin
                     molotov.Thrower.Raw         = botPawn.EntityHandle.Raw;
                     molotov.OriginalThrower.Raw = botPawn.EntityHandle.Raw;
                     molotov.OwnerEntity.Raw     = botPawn.EntityHandle.Raw;
+                    molotov.InitialPosition.X   = origin.X;
+                    molotov.InitialPosition.Y   = origin.Y;
+                    molotov.InitialPosition.Z   = origin.Z;
+                    molotov.InitialVelocity.X   = velocity.X;
+                    molotov.InitialVelocity.Y   = velocity.Y;
+                    molotov.InitialVelocity.Z   = velocity.Z;
+                    molotov.Elasticity          = 0.33f;
                     Server.PrintToConsole(
                         $"[NadeSystem] Replayed [molotov] id={g.Id[..8]}... " +
                         $"bot=[{bot.PlayerName}] " +
@@ -843,6 +831,12 @@ public class NadeSystemPlugin : BasePlugin
             newFlash.Thrower.Raw         = botPawn.EntityHandle.Raw;
             newFlash.OriginalThrower.Raw = botPawn.EntityHandle.Raw;
             newFlash.OwnerEntity.Raw     = botPawn.EntityHandle.Raw;
+            newFlash.InitialPosition.X   = newOrigin.X;
+            newFlash.InitialPosition.Y   = newOrigin.Y;
+            newFlash.InitialPosition.Z   = newOrigin.Z;
+            newFlash.InitialVelocity.X   = newVel.X;
+            newFlash.InitialVelocity.Y   = newVel.Y;
+            newFlash.InitialVelocity.Z   = newVel.Z;
             newFlash.Elasticity          = 0.33f;
             newFlash.Teleport(newOrigin, angles, newVel);
             newFlash.DispatchSpawn();
@@ -886,18 +880,134 @@ public class NadeSystemPlugin : BasePlugin
     //  Round count helpers
     // ═══════════════════════════════════════════════════════════
 
-    private void IncrementCount(string gtype, int teamNum)
+    private bool TryCommitUtilityUse(CCSPlayerController bot, string gtype, bool deductMoney)
     {
-        if (!_roundCountByTeam.TryGetValue(teamNum, out var counter))
-            counter = new RoundCounter();
-        switch (gtype.ToLower())
+        var normalizedType = NormalizeUtilityType(gtype);
+        if (normalizedType == null) return false;
+
+        if (!CanUseUtilityByRoundLimit(bot, normalizedType)) return false;
+
+        if (deductMoney)
         {
-            case "flash":   counter.Flash++;   break;
-            case "smoke":   counter.Smoke++;   break;
-            case "he":      counter.HE++;      break;
+            var money = bot.InGameMoneyServices;
+            if (money == null) return false;
+
+            bool isCT = bot.TeamNum == (int)CsTeam.CounterTerrorist;
+            var costTable = isCT ? CostCT : CostT;
+            if (!costTable.TryGetValue(normalizedType, out int cost)) return false;
+            if (money.Account < cost) return false;
+
+            uint botIdx = (uint)bot.Index;
+            int budget = GetRoundUtilityBudget(bot);
+            if (!_roundSpendPerBot.TryGetValue(botIdx, out int alreadySpent))
+                alreadySpent = 0;
+            if (alreadySpent + cost > budget) return false;
+
+            money.Account -= cost;
+            Utilities.SetStateChanged(bot, "CCSPlayerController", "m_pInGameMoneyServices");
+            _roundSpendPerBot[botIdx] = alreadySpent + cost;
+        }
+
+        CommitUtilityRoundCount(bot, normalizedType);
+        return true;
+    }
+
+    private bool CanUseUtilityByRoundLimit(CCSPlayerController bot, string normalizedType)
+    {
+        var teamCount = GetRoundCount(_roundCountByTeam, bot.TeamNum);
+        if (GetCount(teamCount, normalizedType) >= GetLimit(TeamRoundLimit, normalizedType)) return false;
+
+        uint botIdx = (uint)bot.Index;
+        var botCount = GetRoundCount(_roundCountByBot, botIdx);
+        return GetCount(botCount, normalizedType) < GetLimit(BotRoundLimit, normalizedType);
+    }
+
+    private void CommitUtilityRoundCount(CCSPlayerController bot, string normalizedType)
+    {
+        var teamCount = GetRoundCount(_roundCountByTeam, bot.TeamNum);
+        IncrementRoundCounter(teamCount, normalizedType);
+        _roundCountByTeam[bot.TeamNum] = teamCount;
+
+        uint botIdx = (uint)bot.Index;
+        var botCount = GetRoundCount(_roundCountByBot, botIdx);
+        IncrementRoundCounter(botCount, normalizedType);
+        _roundCountByBot[botIdx] = botCount;
+    }
+
+    private static RoundCounter GetRoundCount<TKey>(Dictionary<TKey, RoundCounter> counts, TKey key)
+        where TKey : notnull
+    {
+        return counts.TryGetValue(key, out var count) ? count : new RoundCounter();
+    }
+
+    private static string? NormalizeUtilityType(string gtype)
+    {
+        return gtype.ToLowerInvariant() switch
+        {
+            "flash" => "flash",
+            "smoke" => "smoke",
+            "he" => "he",
+            "molotov" or "incgrenade" => "molotov",
+            _ => null,
+        };
+    }
+
+    private static int GetCount(RoundCounter counter, string normalizedType)
+    {
+        return normalizedType switch
+        {
+            "flash" => counter.Flash,
+            "smoke" => counter.Smoke,
+            "he" => counter.HE,
+            "molotov" => counter.Molotov,
+            _ => int.MaxValue,
+        };
+    }
+
+    private static int GetLimit(UtilityLimit limit, string normalizedType)
+    {
+        return normalizedType switch
+        {
+            "flash" => limit.Flash,
+            "smoke" => limit.Smoke,
+            "he" => limit.HE,
+            "molotov" => limit.Molotov,
+            _ => 0,
+        };
+    }
+
+    private static void IncrementRoundCounter(RoundCounter counter, string normalizedType)
+    {
+        switch (normalizedType)
+        {
+            case "flash": counter.Flash++; break;
+            case "smoke": counter.Smoke++; break;
+            case "he": counter.HE++; break;
             case "molotov": counter.Molotov++; break;
         }
-        _roundCountByTeam[teamNum] = counter;
+    }
+
+    private int GetRoundUtilityBudget(CCSPlayerController bot)
+    {
+        uint botIdx = (uint)bot.Index;
+        if (_roundUtilityBudgetByBot.TryGetValue(botIdx, out int budget))
+        {
+            return budget;
+        }
+
+        budget = Math.Max(0, bot.InGameMoneyServices?.Account ?? 0);
+        _roundUtilityBudgetByBot[botIdx] = budget;
+        return budget;
+    }
+
+    private void SnapshotRoundUtilityBudgets()
+    {
+        _roundUtilityBudgetByBot.Clear();
+        foreach (var bot in Utilities.FindAllEntitiesByDesignerName<CCSPlayerController>("cs_player_controller"))
+        {
+            if (!bot.IsValid || !bot.IsBot) continue;
+            _roundUtilityBudgetByBot[(uint)bot.Index] = Math.Max(0, bot.InGameMoneyServices?.Account ?? 0);
+        }
     }
 
     private HookResult OnRoundStart(EventRoundStart @event, GameEventInfo info)
@@ -905,10 +1015,12 @@ public class NadeSystemPlugin : BasePlugin
         _roundOver  = false;
         _freezeEndTime = 0f;
         _roundCountByTeam.Clear();
+        _roundCountByBot.Clear();
         _cooldowns.Clear();
         _replayBots.Clear();
         _smokeCooldownBots.Clear();
         _roundSpendPerBot.Clear();
+        _roundUtilityBudgetByBot.Clear();
         _defuseSmokeUsed  = false;
         _defuseFlashUsed  = false;
         _plantSmokeUsed   = false;
@@ -937,6 +1049,7 @@ public class NadeSystemPlugin : BasePlugin
     private HookResult OnFreezeEnd(EventRoundFreezeEnd @event, GameEventInfo info)
     {
         _freezeEndTime = Server.CurrentTime;
+        SnapshotRoundUtilityBudgets();
         return HookResult.Continue;
     }
 
@@ -967,19 +1080,6 @@ public class NadeSystemPlugin : BasePlugin
         catch { return false; }
     }
 
-    private int GetRoundSpendCap(bool isCT, bool isPoor)
-    {
-        if (IsPistolRound()) return 800;
-        // Poor bots get a lower spend cap
-        if (isPoor) return 500;
-
-        var costTable = isCT ? CostCT : CostT;
-        int cap = costTable["flash"]
-                + costTable["smoke"]
-                + costTable["he"]
-                + costTable["molotov"];
-        return cap;
-    }
     // Don't blind ourselves and our teammates
     private HookResult OnPlayerBlind(EventPlayerBlind @event, GameEventInfo info)
     {
@@ -1338,27 +1438,7 @@ public class NadeSystemPlugin : BasePlugin
                 && (int)p.TeamNum != bot.TeamNum);
         if (!hasLiveEnemy) return;
 
-        var money = bot.InGameMoneyServices;
-        if (money == null) return;
-
-        bool isCT     = bot.TeamNum == (int)CsTeam.CounterTerrorist;
-        var costTable = isCT ? CostCT : CostT;
-        if (!costTable.TryGetValue(gtype, out int cost)) return;
-        if (money.Account < cost) return;
-
-        uint botIdx  = (uint)bot.Index;
-        bool isPoor   = _poorBots.Contains((uint)bot.Index);
-        int  spendCap = GetRoundSpendCap(isCT, isPoor);
-        if (!_roundSpendPerBot.TryGetValue(botIdx, out int alreadySpent))
-            alreadySpent = 0;
-        bool deduct = alreadySpent < spendCap;
-
-        if (deduct)
-        {
-            money.Account -= cost;
-            Utilities.SetStateChanged(bot, "CCSPlayerController", "m_pInGameMoneyServices");
-            _roundSpendPerBot[botIdx] = alreadySpent + cost;
-        }
+        if (!TryCommitUtilityUse(bot, gtype, deductMoney: true)) return;
 
         var vel = velocity ?? new Vector(0f, 0f, 0f);
         Server.NextFrame(() =>
@@ -1587,24 +1667,7 @@ public class NadeSystemPlugin : BasePlugin
             if (d > 200f) continue;
             if (IsOnCooldown(g.Id)) continue;
 
-            var money = victim.InGameMoneyServices;
-            if (money == null) continue;
-            bool isCT = victim.TeamNum == (int)CsTeam.CounterTerrorist;
-            var costTable = isCT ? CostCT : CostT;
-            if (!costTable.TryGetValue(gt, out int cost)) continue;
-            if (money.Account < cost) continue;
-
-            uint botIdx = (uint)victim.Index;
-            bool isPoor   = _poorBots.Contains(botIdx);
-            int spendCap = GetRoundSpendCap(isCT, isPoor);
-            if (!_roundSpendPerBot.TryGetValue(botIdx, out int alreadySpent)) alreadySpent = 0;
-            bool deduct = alreadySpent < spendCap;
-            if (deduct)
-            {
-                money.Account -= cost;
-                Utilities.SetStateChanged(victim, "CCSPlayerController", "m_pInGameMoneyServices");
-                _roundSpendPerBot[botIdx] = alreadySpent + cost;
-            }
+            if (!TryCommitUtilityUse(victim, gt, deductMoney: true)) continue;
 
             RegisterCooldown(g.Id, gt);
             SpawnProjectile(victim, g);

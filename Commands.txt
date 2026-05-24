@@ -15,6 +15,17 @@ bot_nades more
 bot_nades max
 bot_nades off
 
+BOT TAUNT
+
+lbtv_bot_taunt 1
+lbtv_bot_taunt 0
+lbtv_bot_chat 1
+lbtv_bot_chat 0
+
+BOT DIFFICULTY
+
+lbtv_difficulty
+
 ADD TEAMS
 
 1.Team Vitality

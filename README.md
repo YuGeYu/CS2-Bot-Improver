@@ -19,6 +19,7 @@ Aims to enhance your experience when playing against bots offline or with friend
 10. Removes the prefix from bot names
 11. Tweaks game rules to make them more friendly to bots
 12. Adds some commands to make the game more fun
+13. Adds LBTV bot taunts and AI chat replies
 
 ## Installation
 
@@ -130,6 +131,34 @@ Point at the ground and press `\` on your keyboard to generate all kinds of kniv
 `scouts_on`  
 `scouts_off`  
 Input the command after a match begins to turn on/off Flying Scoutsman
+
+### LBTV Difficulty
+
+`lbtv_difficulty`  
+Shows the currently active bot difficulty profile
+
+### LBTV Bot Taunt
+
+`lbtv_bot_taunt 0/1`  
+Turn bot taunts off or on
+
+`lbtv_bot_chat 0/1`  
+Turn AI chat replies off or on
+
+Bot AI chat replies use the bundled LBTV API by default. To use your own API, edit:
+
+`game/csgo/addons/counterstrikesharp/configs/plugins/BotTaunt/BotTaunt.json`
+
+Minimum custom config:
+
+```json
+{
+  "AiApiUrl": "https://your-domain.com/api/chat",
+  "AiApiKey": "your_api_key_here"
+}
+```
+
+The API should accept a JSON body with `temperature` and `messages`, and return either `{ "reply": "..." }` or an OpenAI-compatible `choices[0].message.content` response. Restart CS2 or the server after changing the file.
 
 ## FAQ
 

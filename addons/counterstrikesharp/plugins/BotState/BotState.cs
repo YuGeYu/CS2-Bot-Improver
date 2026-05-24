@@ -19,9 +19,9 @@ public class BotState : BasePlugin
     public override string ModuleAuthor => "ed0ard & XBribo";
     public override string ModuleDescription => "Make bots smarter";
 
-    private const float ExpandedValue = 4000f;
+    private const float ExpandedValue = 1000f;
     private const float NormalValue = 50f;
-    private const float RestoreDelay = 1.0f;
+    private const float RestoreDelay = 0.35f;
 
     private bool _isExpanded = false;
     private ConVar? _smokeConVar;
@@ -213,7 +213,7 @@ public class BotState : BasePlugin
             _isDefuseExpanded = true;
             SetSmokeLength(ExpandedValue);
 
-            AddTimer(1.0f, () =>
+            AddTimer(RestoreDelay, () =>
             {
                 _isDefuseExpanded = false;
                 SetSmokeLength(NormalValue);

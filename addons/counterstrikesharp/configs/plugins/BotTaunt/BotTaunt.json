@@ -1,0 +1,11 @@
+{
+  "AiChatEnabled": true,
+  "AiApiUrl": "https://maomaochongmiao.600318.xyz/api/open/ai-chat",
+  "AiApiKey": "mmc_owner_698539c6dc8e829421bcbe793f8d08c97ac4e15469007c290bee8d3ac3a46c6e",
+  "AiModel": "",
+  "AiTemperature": 0.95,
+  "AiChatTimeoutSeconds": 15,
+  "MaxPlayerMessageLength": 300,
+  "MaxAiReplyLength": 220,
+  "ConfigVersion": 1
+}
