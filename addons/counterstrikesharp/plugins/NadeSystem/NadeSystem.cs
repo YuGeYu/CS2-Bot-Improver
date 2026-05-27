@@ -128,6 +128,7 @@ public class NadeSystemPlugin : BasePlugin
     private Dictionary<uint, int> _roundSpendPerBot  = new();
     private Dictionary<uint, int> _roundUtilityBudgetByBot = new();
     private HashSet<uint>         _poorBots          = new();
+    private Dictionary<uint, float> _botThrowRecoveryUntil = new();
     // flash immunity
     private Dictionary<uint, float> _botFlashImmunityUntil = new();
     // Ray-Trace interface
@@ -216,6 +217,19 @@ public class NadeSystemPlugin : BasePlugin
         ["decoy"]   = 600f,  // per-round once
     };
 
+    // Post-throw recovery: plugin-spawned nades are instant, so briefly block firing
+    // without touching movement, defuse, or plant interactions.
+    private static readonly Dictionary<string, float> ThrowRecoverySec =
+        new(StringComparer.OrdinalIgnoreCase)
+    {
+        ["flash"]      = 0.55f,
+        ["smoke"]      = 0.85f,
+        ["he"]         = 0.65f,
+        ["molotov"]    = 0.80f,
+        ["incgrenade"] = 0.80f,
+        ["decoy"]      = 0.55f,
+    };
+
     // T-side purchase cost
     private static readonly Dictionary<string, int> CostT =
         new(StringComparer.OrdinalIgnoreCase)
@@ -299,6 +313,7 @@ public class NadeSystemPlugin : BasePlugin
             _cooldowns.Clear();
             _roundCountByTeam.Clear();
             _replayBots.Clear();
+            _botThrowRecoveryUntil.Clear();
         });
         
         AddCommand("bot_nades", "Control bots' nade throw mode (off/normal/more/max)", CmdBotNades);
@@ -647,6 +662,7 @@ public class NadeSystemPlugin : BasePlugin
                         $"bot=[{bot.PlayerName}] " +
                         $"origin=({origin.X:F0},{origin.Y:F0},{origin.Z:F0}) " +
                         $"vel=({velocity.X:F1},{velocity.Y:F1},{velocity.Z:F1})");
+                    StartThrowRecovery(bot, gtype);
                     return;
                 }
 
@@ -679,6 +695,7 @@ public class NadeSystemPlugin : BasePlugin
                         $"[NadeSystem] Replayed [decoy] id={g.Id[..8]}... " +
                         $"bot=[{bot.PlayerName}] " +
                         $"origin=({origin.X:F0},{origin.Y:F0},{origin.Z:F0})");
+                    StartThrowRecovery(bot, gtype);
                     return;
                 }
 
@@ -714,6 +731,7 @@ public class NadeSystemPlugin : BasePlugin
                         $"bot=[{bot.PlayerName}] " +
                         $"origin=({origin.X:F0},{origin.Y:F0},{origin.Z:F0}) " +
                         $"vel=({velocity.X:F1},{velocity.Y:F1},{velocity.Z:F1})");
+                    StartThrowRecovery(bot, gtype);
                     return;
                 }
 
@@ -748,6 +766,7 @@ public class NadeSystemPlugin : BasePlugin
                         $"bot=[{bot.PlayerName}] " +
                         $"origin=({origin.X:F0},{origin.Y:F0},{origin.Z:F0}) " +
                         $"vel=({velocity.X:F1},{velocity.Y:F1},{velocity.Z:F1})");
+                    StartThrowRecovery(bot, gtype);
                     return;
                 }
 
@@ -784,6 +803,7 @@ public class NadeSystemPlugin : BasePlugin
                         $"bot=[{bot.PlayerName}] " +
                         $"origin=({origin.X:F0},{origin.Y:F0},{origin.Z:F0}) " +
                         $"vel=({velocity.X:F1},{velocity.Y:F1},{velocity.Z:F1})");
+                    StartThrowRecovery(bot, gtype);
                     return;
                 }
 
@@ -869,6 +889,60 @@ public class NadeSystemPlugin : BasePlugin
     {
         float now = Server.CurrentTime;
         _cooldowns.RemoveAll(c => c.ExpiresAt <= now);
+    }
+
+    private void StartThrowRecovery(CCSPlayerController bot, string gtype)
+    {
+        if (!bot.IsValid || !bot.IsBot) return;
+        if (!ThrowRecoverySec.TryGetValue(gtype, out float duration)) return;
+
+        uint botIdx = (uint)bot.Index;
+        float recoveryUntil = Server.CurrentTime + duration;
+        if (_botThrowRecoveryUntil.TryGetValue(botIdx, out float existing)
+            && existing > recoveryUntil)
+        {
+            return;
+        }
+
+        _botThrowRecoveryUntil[botIdx] = recoveryUntil;
+        SuppressBotAttack(bot);
+    }
+
+    private void ApplyThrowRecovery()
+    {
+        if (_botThrowRecoveryUntil.Count == 0) return;
+
+        float now = Server.CurrentTime;
+        foreach (var entry in _botThrowRecoveryUntil.ToArray())
+        {
+            if (entry.Value <= now || _roundOver)
+            {
+                _botThrowRecoveryUntil.Remove(entry.Key);
+                continue;
+            }
+
+            var bot = Utilities
+                .FindAllEntitiesByDesignerName<CCSPlayerController>("cs_player_controller")
+                .FirstOrDefault(p => p.IsValid && p.IsBot && (uint)p.Index == entry.Key);
+            if (bot == null || !bot.IsValid || !bot.IsBot || !bot.PawnIsAlive)
+            {
+                _botThrowRecoveryUntil.Remove(entry.Key);
+                continue;
+            }
+
+            SuppressBotAttack(bot);
+        }
+    }
+
+    private static void SuppressBotAttack(CCSPlayerController bot)
+    {
+        var pawn = bot.PlayerPawn?.Value;
+        if (pawn == null || !pawn.IsValid) return;
+
+        var cbot = pawn.Bot;
+        if (cbot == null) return;
+
+        cbot.IsAttacking = false;
     }
 
     private static float Dist3D(float x1, float y1, float z1, float x2, float y2, float z2)
@@ -1021,6 +1095,7 @@ public class NadeSystemPlugin : BasePlugin
         _smokeCooldownBots.Clear();
         _roundSpendPerBot.Clear();
         _roundUtilityBudgetByBot.Clear();
+        _botThrowRecoveryUntil.Clear();
         _defuseSmokeUsed  = false;
         _defuseFlashUsed  = false;
         _plantSmokeUsed   = false;
@@ -1461,6 +1536,7 @@ public class NadeSystemPlugin : BasePlugin
                     smoke.Thrower.Raw         = botPawn.EntityHandle.Raw;
                     smoke.OriginalThrower.Raw = botPawn.EntityHandle.Raw;
                     smoke.OwnerEntity.Raw     = botPawn.EntityHandle.Raw;
+                    StartThrowRecovery(bot, gtype);
                 }
                 else if (gtype == "flash")
                 {
@@ -1482,6 +1558,7 @@ public class NadeSystemPlugin : BasePlugin
                     flash.Teleport(spawnPos, ang, vel);
                     flash.DispatchSpawn();
                     flash.Teleport(spawnPos, ang, vel);
+                    StartThrowRecovery(bot, gtype);
                 }
             }
             catch (Exception ex)
@@ -1684,6 +1761,7 @@ public class NadeSystemPlugin : BasePlugin
     private void OnTick()
     {
         _tick++;
+        ApplyThrowRecovery();
         if (_tick % 4   == 0) CheckBotZones();
         if (_tick % 256 == 0) PruneCooldowns();
     }
