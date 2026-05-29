@@ -160,6 +160,27 @@ Minimum custom config:
 
 The API should accept a JSON body with `temperature` and `messages`, and return either `{ "reply": "..." }` or an OpenAI-compatible `choices[0].message.content` response. Restart CS2 or the server after changing the file.
 
+Bot taunt text can be edited without rebuilding the plugin:
+
+`game/csgo/addons/counterstrikesharp/configs/plugins/BotTaunt/Taunts.json`
+
+`OpeningTrashTalkBotChance` and `MvpTauntChance` can be adjusted in `BotTaunt.json`. AI chat replies always use a fixed 10-second cooldown.
+
+Bot post-nade firing recovery can be adjusted in:
+
+`game/csgo/addons/counterstrikesharp/configs/plugins/NadeSystem/NadeSystem.json`
+
+Recovery diagnostics:
+
+`lbtv_nade_recovery_debug 0/1`
+Toggle server-console recovery logs
+
+`lbtv_nade_recovery_status`
+Show active recovery timers
+
+`lbtv_nade_recovery_test <flash|smoke|he|molotov|incgrenade|decoy> [seconds]`
+Apply recovery to live bots for quick testing
+
 ## FAQ
 
 ### How to change the difficulty level

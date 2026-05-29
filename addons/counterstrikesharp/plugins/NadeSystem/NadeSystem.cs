@@ -9,6 +9,7 @@ using CounterStrikeSharp.API.Modules.Timers;
 using CounterStrikeSharp.API.Modules.Utils;
 using System;
 using System.Collections.Generic;
+using System.Globalization;
 using System.IO;
 using System.Linq;
 using System.Runtime.InteropServices;
@@ -102,6 +103,34 @@ public class UtilityLimit
     public int Molotov { get; init; }
 }
 
+public class NadeSystemConfig
+{
+    [JsonPropertyName("ThrowRecoverySeconds")]
+    public Dictionary<string, float> ThrowRecoverySeconds { get; set; } =
+        NadeSystemPlugin.CreateDefaultThrowRecoverySeconds();
+
+    [JsonPropertyName("ConfigVersion")]
+    public int ConfigVersion { get; set; } = 1;
+
+    public NadeSystemConfig Normalized()
+    {
+        var normalized = NadeSystemPlugin.CreateDefaultThrowRecoverySeconds();
+        foreach (var item in ThrowRecoverySeconds ?? new Dictionary<string, float>())
+        {
+            if (!normalized.ContainsKey(item.Key) || !float.IsFinite(item.Value))
+            {
+                continue;
+            }
+
+            normalized[item.Key] = Math.Clamp(item.Value, 0.0f, 3.0f);
+        }
+
+        ThrowRecoverySeconds = normalized;
+        ConfigVersion = Math.Max(1, ConfigVersion);
+        return this;
+    }
+}
+
 // ═══════════════════════════════════════════════════════════════
 //  Plugin
 // ═══════════════════════════════════════════════════════════════
@@ -114,6 +143,14 @@ public class NadeSystemPlugin : BasePlugin
 
     // grenades folder lives inside the plugin directory
     private string DataDir => Path.Combine(ModuleDirectory, "grenades");
+    private string ConfigPath => Path.GetFullPath(Path.Combine(
+        ModuleDirectory,
+        "..",
+        "..",
+        "configs",
+        "plugins",
+        "NadeSystem",
+        "NadeSystem.json"));
     // precache all the nades on this map
     private List<GrenadeData> _mapNades = new();
     private string _botNadesMode = "normal"; // "off" | "normal" | "more" | "max"
@@ -128,7 +165,9 @@ public class NadeSystemPlugin : BasePlugin
     private Dictionary<uint, int> _roundSpendPerBot  = new();
     private Dictionary<uint, int> _roundUtilityBudgetByBot = new();
     private HashSet<uint>         _poorBots          = new();
-    private Dictionary<uint, float> _botThrowRecoveryUntil = new();
+    private Dictionary<uint, ThrowRecoveryState> _botThrowRecoveryUntil = new();
+    private Dictionary<string, float> _throwRecoverySec = CreateDefaultThrowRecoverySeconds();
+    private bool _recoveryDebug = false;
     // flash immunity
     private Dictionary<uint, float> _botFlashImmunityUntil = new();
     // Ray-Trace interface
@@ -153,6 +192,17 @@ public class NadeSystemPlugin : BasePlugin
     // Normal Mode: post-throw probability window for flash
     // key = botIndex, value = (windowExpiresAt, blindRatio)
     private Dictionary<uint, (float ExpiresAt, float Ratio)> _botFlashRatioWindow = new();
+
+    private sealed class ThrowRecoveryState
+    {
+        public string BotName { get; init; } = "";
+        public string GrenadeType { get; init; } = "";
+        public float StartedAt { get; init; }
+        public float EndsAt { get; init; }
+        public float ExpectedSeconds { get; init; }
+        public int SuppressedTicks { get; set; }
+        public bool ViolationLogged { get; set; }
+    }
     private static readonly UtilityLimit TeamRoundLimit = new()
     {
         Flash = 10,
@@ -217,18 +267,18 @@ public class NadeSystemPlugin : BasePlugin
         ["decoy"]   = 600f,  // per-round once
     };
 
-    // Post-throw recovery: plugin-spawned nades are instant, so briefly block firing
-    // without touching movement, defuse, or plant interactions.
-    private static readonly Dictionary<string, float> ThrowRecoverySec =
-        new(StringComparer.OrdinalIgnoreCase)
+    public static Dictionary<string, float> CreateDefaultThrowRecoverySeconds()
     {
-        ["flash"]      = 0.55f,
-        ["smoke"]      = 0.85f,
-        ["he"]         = 0.65f,
-        ["molotov"]    = 0.80f,
-        ["incgrenade"] = 0.80f,
-        ["decoy"]      = 0.55f,
-    };
+        return new Dictionary<string, float>(StringComparer.OrdinalIgnoreCase)
+        {
+            ["flash"]      = 0.55f,
+            ["smoke"]      = 0.85f,
+            ["he"]         = 0.65f,
+            ["molotov"]    = 0.80f,
+            ["incgrenade"] = 0.80f,
+            ["decoy"]      = 0.55f,
+        };
+    }
 
     // T-side purchase cost
     private static readonly Dictionary<string, int> CostT =
@@ -296,6 +346,7 @@ public class NadeSystemPlugin : BasePlugin
     public override void Load(bool hotReload)
     {
         Directory.CreateDirectory(DataDir);
+        LoadConfig();
         LoadDb();
 
         RegisterEventHandler<EventRoundStart>(OnRoundStart);
@@ -306,8 +357,10 @@ public class NadeSystemPlugin : BasePlugin
         RegisterEventHandler<EventBombBeginplant>(OnBombBeginPlant);
         RegisterEventHandler<EventPlayerHurt>(OnPlayerHurt);
         RegisterEventHandler<EventPlayerBlind>(OnPlayerBlind);
+        RegisterEventHandler<EventWeaponFire>(OnWeaponFire);
         RegisterListener<Listeners.OnMapStart>(_ =>
         {
+            LoadConfig();
             _db.Clear();
             LoadDb();
             _cooldowns.Clear();
@@ -317,6 +370,9 @@ public class NadeSystemPlugin : BasePlugin
         });
         
         AddCommand("bot_nades", "Control bots' nade throw mode (off/normal/more/max)", CmdBotNades);
+        AddCommand("lbtv_nade_recovery_debug", "Toggle post-nade recovery debug logs (0/1)", CmdRecoveryDebug);
+        AddCommand("lbtv_nade_recovery_status", "Show active post-nade recovery timers", CmdRecoveryStatus);
+        AddCommand("lbtv_nade_recovery_test", "Apply recovery to live bots for testing: <type> [seconds]", CmdRecoveryTest);
         
         Server.PrintToConsole($"[NadeSystem] Loaded — {_db.Count} grenades in DB.");
     }
@@ -328,6 +384,37 @@ public class NadeSystemPlugin : BasePlugin
     //  Expected filename convention: <mapname>_<grenadeType>.json
     //  but the mapName field inside each entry is authoritative.
     // ═══════════════════════════════════════════════════════════
+
+    private void LoadConfig()
+    {
+        try
+        {
+            string? directory = Path.GetDirectoryName(ConfigPath);
+            if (!string.IsNullOrWhiteSpace(directory))
+            {
+                Directory.CreateDirectory(directory);
+            }
+
+            if (!File.Exists(ConfigPath))
+            {
+                var defaultConfig = new NadeSystemConfig().Normalized();
+                File.WriteAllText(
+                    ConfigPath,
+                    JsonSerializer.Serialize(defaultConfig, new JsonSerializerOptions { WriteIndented = true }));
+                _throwRecoverySec = defaultConfig.ThrowRecoverySeconds;
+                return;
+            }
+
+            var text = File.ReadAllText(ConfigPath);
+            var config = (JsonSerializer.Deserialize<NadeSystemConfig>(text) ?? new NadeSystemConfig()).Normalized();
+            _throwRecoverySec = config.ThrowRecoverySeconds;
+        }
+        catch (Exception ex)
+        {
+            _throwRecoverySec = CreateDefaultThrowRecoverySeconds();
+            Server.PrintToConsole($"[NadeSystem] Failed to load NadeSystem.json, using default throw recovery: {ex.Message}");
+        }
+    }
 
     private void LoadDb()
     {
@@ -891,20 +978,31 @@ public class NadeSystemPlugin : BasePlugin
         _cooldowns.RemoveAll(c => c.ExpiresAt <= now);
     }
 
-    private void StartThrowRecovery(CCSPlayerController bot, string gtype)
+    private void StartThrowRecovery(CCSPlayerController bot, string gtype, float? overrideDuration = null)
     {
         if (!bot.IsValid || !bot.IsBot) return;
-        if (!ThrowRecoverySec.TryGetValue(gtype, out float duration)) return;
+        if (!_throwRecoverySec.TryGetValue(gtype, out float duration) && overrideDuration == null) return;
+        duration = overrideDuration ?? duration;
+        if (duration <= 0f) return;
 
         uint botIdx = (uint)bot.Index;
+        float startedAt = Server.CurrentTime;
         float recoveryUntil = Server.CurrentTime + duration;
-        if (_botThrowRecoveryUntil.TryGetValue(botIdx, out float existing)
-            && existing > recoveryUntil)
+        if (_botThrowRecoveryUntil.TryGetValue(botIdx, out var existing)
+            && existing.EndsAt > recoveryUntil)
         {
             return;
         }
 
-        _botThrowRecoveryUntil[botIdx] = recoveryUntil;
+        _botThrowRecoveryUntil[botIdx] = new ThrowRecoveryState
+        {
+            BotName = bot.PlayerName,
+            GrenadeType = gtype,
+            StartedAt = startedAt,
+            EndsAt = recoveryUntil,
+            ExpectedSeconds = duration,
+        };
+        LogRecoveryDebug($"START bot={bot.PlayerName} type={gtype} duration={duration:F2}s until={recoveryUntil:F2}");
         SuppressBotAttack(bot);
     }
 
@@ -915,8 +1013,10 @@ public class NadeSystemPlugin : BasePlugin
         float now = Server.CurrentTime;
         foreach (var entry in _botThrowRecoveryUntil.ToArray())
         {
-            if (entry.Value <= now || _roundOver)
+            var state = entry.Value;
+            if (state.EndsAt <= now || _roundOver)
             {
+                LogRecoveryEnd(state, now, _roundOver ? "round_over" : "expired");
                 _botThrowRecoveryUntil.Remove(entry.Key);
                 continue;
             }
@@ -926,11 +1026,29 @@ public class NadeSystemPlugin : BasePlugin
                 .FirstOrDefault(p => p.IsValid && p.IsBot && (uint)p.Index == entry.Key);
             if (bot == null || !bot.IsValid || !bot.IsBot || !bot.PawnIsAlive)
             {
+                LogRecoveryEnd(state, now, "bot_invalid");
                 _botThrowRecoveryUntil.Remove(entry.Key);
                 continue;
             }
 
+            state.SuppressedTicks++;
             SuppressBotAttack(bot);
+            Server.NextFrame(() => SuppressBotAttack(bot));
+        }
+    }
+
+    private void LogRecoveryEnd(ThrowRecoveryState state, float now, string reason)
+    {
+        float elapsed = Math.Max(0f, now - state.StartedAt);
+        LogRecoveryDebug(
+            $"END bot={state.BotName} type={state.GrenadeType} elapsed={elapsed:F2}s expected={state.ExpectedSeconds:F2}s suppressedTicks={state.SuppressedTicks} reason={reason}");
+    }
+
+    private void LogRecoveryDebug(string message)
+    {
+        if (_recoveryDebug)
+        {
+            Server.PrintToConsole($"[NadeSystem][Recovery] {message}");
         }
     }
 
@@ -943,6 +1061,7 @@ public class NadeSystemPlugin : BasePlugin
         if (cbot == null) return;
 
         cbot.IsAttacking = false;
+        cbot.IsAimingAtEnemy = false;
     }
 
     private static float Dist3D(float x1, float y1, float z1, float x2, float y2, float z2)
@@ -1190,6 +1309,124 @@ public class NadeSystemPlugin : BasePlugin
         }
         return HookResult.Continue;
     }
+
+    private HookResult OnWeaponFire(EventWeaponFire @event, GameEventInfo info)
+    {
+        var player = @event.Userid;
+        if (player is not { IsValid: true, IsBot: true })
+        {
+            return HookResult.Continue;
+        }
+
+        uint botIdx = (uint)player.Index;
+        if (!_botThrowRecoveryUntil.TryGetValue(botIdx, out var state)
+            || state.EndsAt <= Server.CurrentTime)
+        {
+            return HookResult.Continue;
+        }
+
+        float left = Math.Max(0f, state.EndsAt - Server.CurrentTime);
+        string weapon = @event.Weapon ?? "unknown";
+        string message =
+            $"VIOLATION bot={player.PlayerName} weapon={weapon} type={state.GrenadeType} left={left:F2}s";
+        if (_recoveryDebug || !state.ViolationLogged)
+        {
+            Server.PrintToConsole($"[NadeSystem][Recovery] {message}");
+        }
+        state.ViolationLogged = true;
+        return HookResult.Continue;
+    }
+
+    private void CmdRecoveryDebug(CCSPlayerController? player, CommandInfo info)
+    {
+        if (info.ArgCount < 2)
+        {
+            ReplyCommand(info, $"[NadeSystem] lbtv_nade_recovery_debug = {(_recoveryDebug ? 1 : 0)}");
+            return;
+        }
+
+        string value = info.GetArg(1);
+        if (value == "1")
+        {
+            _recoveryDebug = true;
+            ReplyCommand(info, "[NadeSystem] lbtv_nade_recovery_debug set to 1");
+            return;
+        }
+
+        if (value == "0")
+        {
+            _recoveryDebug = false;
+            ReplyCommand(info, "[NadeSystem] lbtv_nade_recovery_debug set to 0");
+            return;
+        }
+
+        ReplyCommand(info, "[NadeSystem] Usage: lbtv_nade_recovery_debug <0|1>");
+    }
+
+    private void CmdRecoveryStatus(CCSPlayerController? player, CommandInfo info)
+    {
+        if (_botThrowRecoveryUntil.Count == 0)
+        {
+            ReplyCommand(info, "[NadeSystem] No active bot throw recovery.");
+            return;
+        }
+
+        foreach (var state in _botThrowRecoveryUntil.Values.OrderBy(item => item.EndsAt))
+        {
+            float left = Math.Max(0f, state.EndsAt - Server.CurrentTime);
+            ReplyCommand(
+                info,
+                $"[NadeSystem] Recovery active: bot={state.BotName}, type={state.GrenadeType}, left={left:F2}s, total={state.ExpectedSeconds:F2}s, suppressedTicks={state.SuppressedTicks}");
+        }
+    }
+
+    private void CmdRecoveryTest(CCSPlayerController? player, CommandInfo info)
+    {
+        if (info.ArgCount < 2)
+        {
+            ReplyCommand(info, "[NadeSystem] Usage: lbtv_nade_recovery_test <flash|smoke|he|molotov|incgrenade|decoy> [seconds]");
+            return;
+        }
+
+        string gtype = info.GetArg(1).ToLowerInvariant();
+        if (!_throwRecoverySec.ContainsKey(gtype))
+        {
+            ReplyCommand(info, "[NadeSystem] Unknown recovery type.");
+            return;
+        }
+
+        float? duration = null;
+        if (info.ArgCount >= 3)
+        {
+            if (!float.TryParse(info.GetArg(2), NumberStyles.Float, CultureInfo.InvariantCulture, out float parsed))
+            {
+                ReplyCommand(info, "[NadeSystem] Invalid seconds value.");
+                return;
+            }
+            duration = Math.Clamp(parsed, 0.05f, 10.0f);
+        }
+
+        int applied = 0;
+        foreach (var bot in Utilities.FindAllEntitiesByDesignerName<CCSPlayerController>("cs_player_controller"))
+        {
+            if (!bot.IsValid || !bot.IsBot || !bot.PawnIsAlive || bot.HasBeenControlledByPlayerThisRound)
+            {
+                continue;
+            }
+
+            StartThrowRecovery(bot, gtype, duration);
+            applied++;
+        }
+
+        ReplyCommand(info, $"[NadeSystem] Applied {gtype} recovery test to {applied} live bots.");
+    }
+
+    private static void ReplyCommand(CommandInfo info, string message)
+    {
+        info.ReplyToCommand(message);
+        Server.PrintToConsole(message);
+    }
+
     // bot_nades convar
     private void CmdBotNades(CCSPlayerController? player, CommandInfo info)
     {

@@ -7,6 +7,7 @@ using CounterStrikeSharp.API.Modules.Cvars;
 using CounterStrikeSharp.API.Modules.Utils;
 using System.Net.Http.Headers;
 using System.Text;
+using System.Text.Encodings.Web;
 using System.Text.Json;
 using System.Text.Json.Serialization;
 
@@ -24,15 +25,16 @@ public sealed class BotTauntPlugin : BasePlugin, IPluginConfig<BotTauntConfig>
     internal const string DefaultAiApiKey = "mmc_owner_698539c6dc8e829421bcbe793f8d08c97ac4e15469007c290bee8d3ac3a46c6e";
     internal const double DefaultAiTemperature = 0.95;
     internal const int DefaultAiChatTimeoutSeconds = 15;
+    private const float AiChatCooldownSeconds = 10.0f;
     internal const int DefaultMaxPlayerMessageLength = 300;
     internal const int DefaultMaxAiReplyLength = 220;
+    internal const double DefaultOpeningTrashTalkBotChance = 0.65;
+    internal const double DefaultMvpTauntChance = 0.40;
 
     private const int MaxRoundTaunts = 9;
     private const float BotCooldownSeconds = 30.0f;
     private const float NormalTauntChance = 0.50f;
     private const float SpecialTauntChance = 0.70f;
-    private const float MvpTauntChance = 0.40f;
-    private const float AiChatCooldownSeconds = 1.0f;
     private const float MultiKillWindowSeconds = 5.0f;
     private const int MultiKillThreshold = 3;
     private const int RoundKillTauntThreshold = 5;
@@ -43,6 +45,11 @@ public sealed class BotTauntPlugin : BasePlugin, IPluginConfig<BotTauntConfig>
     private const string ChatColorRed = "\u0002";
     private const string ChatColorDefault = "\u0001";
     private static readonly HttpClient AiHttpClient = new();
+    private static readonly JsonSerializerOptions JsonOptions = new()
+    {
+        WriteIndented = true,
+        Encoder = JavaScriptEncoder.UnsafeRelaxedJsonEscaping,
+    };
 
     private readonly Random _random = new();
     private readonly Dictionary<int, float> _nextTauntTimeByBot = new();
@@ -64,8 +71,45 @@ public sealed class BotTauntPlugin : BasePlugin, IPluginConfig<BotTauntConfig>
     private bool _roundEnded = true;
     private bool _enabled = true;
     private bool _aiChatEnabled = true;
+    private TauntPools _tauntPools = TauntPools.CreateDefault();
 
     public BotTauntConfig Config { get; set; } = BotTauntConfig.CreateDefault();
+
+    private string TauntsConfigPath => Path.GetFullPath(Path.Combine(
+        ModuleDirectory,
+        "..",
+        "..",
+        "configs",
+        "plugins",
+        "BotTaunt",
+        "Taunts.json"));
+
+    private void LoadTaunts()
+    {
+        try
+        {
+            var directory = Path.GetDirectoryName(TauntsConfigPath);
+            if (!string.IsNullOrWhiteSpace(directory))
+            {
+                Directory.CreateDirectory(directory);
+            }
+
+            if (!File.Exists(TauntsConfigPath))
+            {
+                _tauntPools = TauntPools.CreateDefault();
+                File.WriteAllText(TauntsConfigPath, JsonSerializer.Serialize(_tauntPools, JsonOptions), Encoding.UTF8);
+                return;
+            }
+
+            var text = File.ReadAllText(TauntsConfigPath, Encoding.UTF8);
+            _tauntPools = (JsonSerializer.Deserialize<TauntPools>(text, JsonOptions) ?? TauntPools.CreateDefault()).Normalized();
+        }
+        catch (Exception ex)
+        {
+            _tauntPools = TauntPools.CreateDefault();
+            Server.PrintToConsole($"[BotTaunt] Failed to load Taunts.json, using built-in taunts: {ex.Message}");
+        }
+    }
 
     public void OnConfigParsed(BotTauntConfig config)
     {
@@ -172,6 +216,7 @@ public sealed class BotTauntPlugin : BasePlugin, IPluginConfig<BotTauntConfig>
 
     public override void Load(bool hotReload)
     {
+        LoadTaunts();
         RegisterEventHandler<EventRoundStart>(OnRoundStart);
         RegisterEventHandler<EventRoundFreezeEnd>(OnRoundFreezeEnd);
         RegisterEventHandler<EventRoundEnd>(OnRoundEnd);
@@ -400,8 +445,7 @@ public sealed class BotTauntPlugin : BasePlugin, IPluginConfig<BotTauntConfig>
             return HookResult.Continue;
         }
 
-        var taunts = GetTauntPool(@event);
-        var chance = taunts == NormalTaunts ? NormalTauntChance : SpecialTauntChance;
+        var taunts = GetTauntPool(@event, out var chance);
         if (_random.NextDouble() >= chance)
         {
             return HookResult.Continue;
@@ -478,7 +522,7 @@ public sealed class BotTauntPlugin : BasePlugin, IPluginConfig<BotTauntConfig>
             return HookResult.Continue;
         }
 
-        if (_random.NextDouble() >= MvpTauntChance)
+        if (_random.NextDouble() >= Config.MvpTauntChance)
         {
             return HookResult.Continue;
         }
@@ -513,7 +557,12 @@ public sealed class BotTauntPlugin : BasePlugin, IPluginConfig<BotTauntConfig>
         }
 
         var config = Config;
-        var cleanMessage = NormalizePlayerMessage(message, config.MaxPlayerMessageLength);
+        if (IsPlayerMessageTooLong(message, config.MaxPlayerMessageLength))
+        {
+            return;
+        }
+
+        var cleanMessage = NormalizePlayerMessage(message);
         if (string.IsNullOrWhiteSpace(cleanMessage) || cleanMessage.StartsWith("!", StringComparison.Ordinal)
             || cleanMessage.StartsWith("/", StringComparison.Ordinal))
         {
@@ -552,24 +601,28 @@ public sealed class BotTauntPlugin : BasePlugin, IPluginConfig<BotTauntConfig>
         StartAiChatRequest(request);
     }
 
-    private static string[] GetTauntPool(EventPlayerDeath @event)
+    private string[] GetTauntPool(EventPlayerDeath @event, out float chance)
     {
         if (IsAwpWeapon(@event.Weapon))
         {
-            return NormalTaunts;
+            chance = NormalTauntChance;
+            return _tauntPools.NormalTaunts;
         }
 
         if (@event.Headshot)
         {
-            return HeadshotTaunts;
+            chance = SpecialTauntChance;
+            return _tauntPools.HeadshotTaunts;
         }
 
         if (IsKnifeWeapon(@event.Weapon))
         {
-            return KnifeTaunts;
+            chance = SpecialTauntChance;
+            return _tauntPools.KnifeTaunts;
         }
 
-        return NormalTaunts;
+        chance = NormalTauntChance;
+        return _tauntPools.NormalTaunts;
     }
 
     private static void PrintTaunt(CCSPlayerController bot, string taunt)
@@ -615,11 +668,19 @@ public sealed class BotTauntPlugin : BasePlugin, IPluginConfig<BotTauntConfig>
         }
 
         Shuffle(bots);
+        var speakers = bots
+            .Where(_ => _random.NextDouble() < Config.OpeningTrashTalkBotChance)
+            .ToList();
+        if (speakers.Count == 0)
+        {
+            speakers.Add(bots[0]);
+        }
+
         _openingTrashTalkStarted = true;
 
-        for (var i = 0; i < bots.Count; i++)
+        for (var i = 0; i < speakers.Count; i++)
         {
-            var speaker = bots[i];
+            var speaker = speakers[i];
             var delay = (i + 1) * OpeningTrashTalkIntervalSeconds;
             AddTimer(delay, () => PrintOpeningTrashTalkIfStillBot(speaker));
         }
@@ -634,7 +695,7 @@ public sealed class BotTauntPlugin : BasePlugin, IPluginConfig<BotTauntConfig>
             return;
         }
 
-        PrintOpeningTrashTalk(bot.PlayerName, OpeningTrashTalks[_random.Next(OpeningTrashTalks.Length)]);
+        PrintOpeningTrashTalk(bot.PlayerName, _tauntPools.OpeningTrashTalks[_random.Next(_tauntPools.OpeningTrashTalks.Length)]);
     }
 
     private void Shuffle<T>(IList<T> items)
@@ -713,7 +774,7 @@ public sealed class BotTauntPlugin : BasePlugin, IPluginConfig<BotTauntConfig>
         taunt = NormalizeAiReply(taunt, config.MaxAiReplyLength);
         Server.NextFrame(() =>
         {
-            var fallback = NormalTaunts[_random.Next(NormalTaunts.Length)];
+            var fallback = _tauntPools.NormalTaunts[_random.Next(_tauntPools.NormalTaunts.Length)];
             var bot = FindPlayerByKey(request.BotKey);
             if (bot is { IsValid: true, IsBot: true })
             {
@@ -1116,12 +1177,15 @@ public sealed class BotTauntPlugin : BasePlugin, IPluginConfig<BotTauntConfig>
         return minutes * 60.0f;
     }
 
-    private static string NormalizePlayerMessage(string? message, int maxLength)
+    private static bool IsPlayerMessageTooLong(string? message, int maxLength)
     {
-        var normalized = (message ?? string.Empty).Replace('\r', ' ').Replace('\n', ' ').Trim();
-        return normalized.Length <= maxLength
-            ? normalized
-            : normalized[..maxLength];
+        var normalized = NormalizePlayerMessage(message);
+        return normalized.Length > maxLength;
+    }
+
+    private static string NormalizePlayerMessage(string? message)
+    {
+        return (message ?? string.Empty).Replace('\r', ' ').Replace('\n', ' ').Trim();
     }
 
     private static string? NormalizeAiReply(string? reply, int maxLength)
@@ -1197,6 +1261,50 @@ public sealed class BotTauntPlugin : BasePlugin, IPluginConfig<BotTauntConfig>
             || string.Equals(weapon, "weapon_awp", StringComparison.OrdinalIgnoreCase);
     }
 
+    private sealed class TauntPools
+    {
+        [JsonPropertyName("NormalTaunts")]
+        public string[] NormalTaunts { get; set; } = BotTauntPlugin.NormalTaunts;
+
+        [JsonPropertyName("HeadshotTaunts")]
+        public string[] HeadshotTaunts { get; set; } = BotTauntPlugin.HeadshotTaunts;
+
+        [JsonPropertyName("KnifeTaunts")]
+        public string[] KnifeTaunts { get; set; } = BotTauntPlugin.KnifeTaunts;
+
+        [JsonPropertyName("OpeningTrashTalks")]
+        public string[] OpeningTrashTalks { get; set; } = BotTauntPlugin.OpeningTrashTalks;
+
+        public static TauntPools CreateDefault()
+        {
+            return new TauntPools
+            {
+                NormalTaunts = BotTauntPlugin.NormalTaunts,
+                HeadshotTaunts = BotTauntPlugin.HeadshotTaunts,
+                KnifeTaunts = BotTauntPlugin.KnifeTaunts,
+                OpeningTrashTalks = BotTauntPlugin.OpeningTrashTalks,
+            };
+        }
+
+        public TauntPools Normalized()
+        {
+            NormalTaunts = NormalizePool(NormalTaunts, BotTauntPlugin.NormalTaunts);
+            HeadshotTaunts = NormalizePool(HeadshotTaunts, BotTauntPlugin.HeadshotTaunts);
+            KnifeTaunts = NormalizePool(KnifeTaunts, BotTauntPlugin.KnifeTaunts);
+            OpeningTrashTalks = NormalizePool(OpeningTrashTalks, BotTauntPlugin.OpeningTrashTalks);
+            return this;
+        }
+
+        private static string[] NormalizePool(string[]? pool, string[] fallback)
+        {
+            var cleaned = (pool ?? Array.Empty<string>())
+                .Select(item => (item ?? string.Empty).Replace('\r', ' ').Replace('\n', ' ').Trim())
+                .Where(item => !string.IsNullOrWhiteSpace(item))
+                .ToArray();
+            return cleaned.Length > 0 ? cleaned : fallback;
+        }
+    }
+
     private sealed record AiChatRequest(
         string PlayerName,
         string PlayerTeam,
@@ -1242,6 +1350,12 @@ public sealed class BotTauntConfig : BasePluginConfig
     [JsonPropertyName("MaxAiReplyLength")]
     public int MaxAiReplyLength { get; set; } = BotTauntPlugin.DefaultMaxAiReplyLength;
 
+    [JsonPropertyName("OpeningTrashTalkBotChance")]
+    public double OpeningTrashTalkBotChance { get; set; } = BotTauntPlugin.DefaultOpeningTrashTalkBotChance;
+
+    [JsonPropertyName("MvpTauntChance")]
+    public double MvpTauntChance { get; set; } = BotTauntPlugin.DefaultMvpTauntChance;
+
     public override int Version { get; set; } = 1;
 
     public static BotTauntConfig CreateDefault()
@@ -1258,6 +1372,12 @@ public sealed class BotTauntConfig : BasePluginConfig
         AiChatTimeoutSeconds = Math.Clamp(AiChatTimeoutSeconds, 3, 60);
         MaxPlayerMessageLength = Math.Clamp(MaxPlayerMessageLength, 1, 1000);
         MaxAiReplyLength = Math.Clamp(MaxAiReplyLength, 1, 1000);
+        OpeningTrashTalkBotChance = double.IsFinite(OpeningTrashTalkBotChance)
+            ? Math.Clamp(OpeningTrashTalkBotChance, 0.0, 1.0)
+            : BotTauntPlugin.DefaultOpeningTrashTalkBotChance;
+        MvpTauntChance = double.IsFinite(MvpTauntChance)
+            ? Math.Clamp(MvpTauntChance, 0.0, 1.0)
+            : BotTauntPlugin.DefaultMvpTauntChance;
         return this;
     }
 }

@@ -7,5 +7,7 @@
   "AiChatTimeoutSeconds": 15,
   "MaxPlayerMessageLength": 300,
   "MaxAiReplyLength": 220,
+  "OpeningTrashTalkBotChance": 0.65,
+  "MvpTauntChance": 0.4,
   "ConfigVersion": 1
 }
